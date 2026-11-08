@@ -8,6 +8,10 @@ from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+import urllib3
+
+# TLS 代理重试时不验证代理证书，不让 urllib3 的警告刷屏
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 MAX_PROXIES = 500
 WORKERS = 5
@@ -94,44 +98,64 @@ def check_proxy(index, proxy, total):
             "ip_type": "Unknown",
         }
 
-    # 第二步：TCP 通了，再走代理发 HTTP 请求拿出口 IP 和地区
+    # 第二步：TCP 通了，再走代理发 HTTP 请求拿出口 IP 和地区。
+    # 先按原协议试一次，不行再试 TLS 代理（https://，不验证代理证书，
+    # 很多 TLS 代理用的是自签证书）。
+    scheme = parsed.scheme.lower()
+    if scheme == "https":
+        attempts = [(proxy, True), (proxy, False)]
+    else:
+        # 同一地址改走 TLS，账号密码（如果有）保留
+        tls_proxy = parsed._replace(scheme="https").geturl()
+        attempts = [(proxy, True), (tls_proxy, False)]
+
     started = time.monotonic()
+    last_error = None
+    for attempt_no, (proxy_url, verify) in enumerate(attempts):
+        try:
+            response = requests.get(
+                TEST_URL,
+                proxies={"http": proxy_url, "https": proxy_url},
+                timeout=TIMEOUT if attempt_no == 0 else 10,
+                verify=verify,
+            )
+            response.raise_for_status()
+            exit_ip = response.json().get("ip")
+            if not exit_ip:
+                raise ValueError("No exit IP returned")
 
-    try:
-        response = requests.get(
-            TEST_URL,
-            proxies={"http": proxy, "https": proxy},
-            timeout=TIMEOUT,
-        )
-        response.raise_for_status()
-        exit_ip = response.json().get("ip")
-        if not exit_ip:
-            raise ValueError("No exit IP returned")
+            latency = round((time.monotonic() - started) * 1000)
+            mode = urlsplit(proxy_url).scheme.upper()
+            geo = lookup_geo_ip(exit_ip)
+            print(
+                f"[{index}/{total}] 在线 | 代理: {safe_label(proxy)} | "
+                f"方式: {mode} | 出口 IP: {exit_ip} | {geo['country']} | "
+                f"{geo['ip_type']} | TCP {tcp_latency} ms / 总 {latency} ms",
+                flush=True,
+            )
+            return {
+                "exit_ip": exit_ip,
+                "latency": latency,
+                "status": "在线",
+                "country": geo["country"],
+                "ip_type": geo["ip_type"],
+            }
+        except Exception as exc:
+            last_error = exc
+            continue
 
-        latency = round((time.monotonic() - started) * 1000)
-        geo = lookup_geo_ip(exit_ip)
-        print(
-            f"[{index}/{total}] 在线 | 代理: {safe_label(proxy)} | "
-            f"出口 IP: {exit_ip} | {geo['country']} | "
-            f"{geo['ip_type']} | TCP {tcp_latency} ms / 总 {latency} ms",
-            flush=True,
-        )
-        return {
-            "exit_ip": exit_ip,
-            "latency": latency,
-            "status": "在线",
-            "country": geo["country"],
-            "ip_type": geo["ip_type"],
-        }
-    except Exception:
-        print(f"[{index}/{total}] 离线 | TCP 通但代理请求失败", flush=True)
-        return {
-            "exit_ip": "",
-            "latency": 0,
-            "status": "离线",
-            "country": "Unknown",
-            "ip_type": "Unknown",
-        }
+    print(
+        f"[{index}/{total}] 离线 | TCP 通但代理请求失败"
+        f"（http/https 均失败：{last_error}）",
+        flush=True,
+    )
+    return {
+        "exit_ip": "",
+        "latency": 0,
+        "status": "离线",
+        "country": "Unknown",
+        "ip_type": "Unknown",
+    }
 
 
 def main():
