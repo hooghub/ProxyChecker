@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import os
+import socket
 import sys
+import threading
 import time
 from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,7 +12,40 @@ import requests
 MAX_PROXIES = 500
 WORKERS = 5
 TIMEOUT = 15
+TCP_TIMEOUT = 5
 TEST_URL = "https://api.ipify.org?format=json"
+GEO_URL = "http://ip-api.com/json/{ip}?fields=status,country,hosting,mobile"
+
+_geo_cache = {}
+_geo_lock = threading.Lock()
+
+
+def lookup_geo_ip(exit_ip):
+    """查单个出口 IP 的国家和网络类型，相同出口 IP 只查一次。"""
+    with _geo_lock:
+        if exit_ip in _geo_cache:
+            return _geo_cache[exit_ip]
+    info = {"country": "Unknown", "ip_type": "Unknown"}
+    try:
+        response = requests.get(GEO_URL.format(ip=exit_ip), timeout=TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") == "success":
+            if data.get("hosting") is True:
+                ip_type = "Datacenter"
+            elif data.get("mobile") is True:
+                ip_type = "Mobile"
+            else:
+                ip_type = "Unknown"
+            info = {
+                "country": data.get("country") or "Unknown",
+                "ip_type": ip_type,
+            }
+    except Exception:
+        pass
+    with _geo_lock:
+        _geo_cache[exit_ip] = info
+    return info
 
 
 def parse_proxy(line):
@@ -40,6 +75,26 @@ def safe_label(proxy):
 
 def check_proxy(index, proxy, total):
     print(f"[{index}/{total}] 检测中: {safe_label(proxy)}", flush=True)
+    parsed = urlsplit(proxy)
+    host, port = parsed.hostname, parsed.port
+
+    # 第一步：TCP 直连，看端口通不通
+    tcp_started = time.monotonic()
+    try:
+        with socket.create_connection((host, port), timeout=TCP_TIMEOUT):
+            pass
+        tcp_latency = round((time.monotonic() - tcp_started) * 1000)
+    except Exception:
+        print(f"[{index}/{total}] 离线 | TCP 连接失败", flush=True)
+        return {
+            "exit_ip": "",
+            "latency": 0,
+            "status": "离线",
+            "country": "Unknown",
+            "ip_type": "Unknown",
+        }
+
+    # 第二步：TCP 通了，再走代理发 HTTP 请求拿出口 IP 和地区
     started = time.monotonic()
 
     try:
@@ -54,19 +109,22 @@ def check_proxy(index, proxy, total):
             raise ValueError("No exit IP returned")
 
         latency = round((time.monotonic() - started) * 1000)
+        geo = lookup_geo_ip(exit_ip)
         print(
-            f"[{index}/{total}] 在线 | 出口 IP: {exit_ip} | {latency} ms",
+            f"[{index}/{total}] 在线 | 代理: {safe_label(proxy)} | "
+            f"出口 IP: {exit_ip} | {geo['country']} | "
+            f"{geo['ip_type']} | TCP {tcp_latency} ms / 总 {latency} ms",
             flush=True,
         )
         return {
             "exit_ip": exit_ip,
             "latency": latency,
             "status": "在线",
-            "country": "Unknown",
-            "ip_type": "Unknown",
+            "country": geo["country"],
+            "ip_type": geo["ip_type"],
         }
     except Exception:
-        print(f"[{index}/{total}] 离线或连接失败", flush=True)
+        print(f"[{index}/{total}] 离线 | TCP 通但代理请求失败", flush=True)
         return {
             "exit_ip": "",
             "latency": 0,
@@ -74,53 +132,6 @@ def check_proxy(index, proxy, total):
             "country": "Unknown",
             "ip_type": "Unknown",
         }
-
-
-def lookup_geo(results):
-    online = [item for item in results if item["status"] == "在线"]
-    unique_ips = list(dict.fromkeys(item["exit_ip"] for item in online))
-    if not unique_ips:
-        return
-
-    print("\n[地区] 正在查询出口 IP 地区信息...")
-    geo_data = {}
-
-    for offset in range(0, len(unique_ips), 100):
-        batch = unique_ips[offset:offset + 100]
-        try:
-            response = requests.post(
-                "http://ip-api.com/batch",
-                json=[
-                    {
-                        "query": ip,
-                        "fields": "status,query,country,hosting,mobile"
-                    }
-                    for ip in batch
-                ],
-                timeout=TIMEOUT,
-            )
-            response.raise_for_status()
-
-            for item in response.json():
-                if item.get("status") != "success":
-                    continue
-                if item.get("hosting") is True:
-                    ip_type = "Datacenter"
-                elif item.get("mobile") is True:
-                    ip_type = "Mobile"
-                else:
-                    ip_type = "Unknown"
-                geo_data[item.get("query")] = {
-                    "country": item.get("country") or "Unknown",
-                    "ip_type": ip_type,
-                }
-        except Exception as exc:
-            print(f"[提示] 地区查询暂不可用：{exc}")
-
-    for item in online:
-        info = geo_data.get(item["exit_ip"], {})
-        item["country"] = info.get("country", "Unknown")
-        item["ip_type"] = info.get("ip_type", "Unknown")
 
 
 def main():
@@ -162,8 +173,6 @@ def main():
         ]
         for future in as_completed(futures):
             results.append(future.result())
-
-    lookup_geo(results)
 
     online = [item for item in results if item["status"] == "在线"]
     output_file = os.path.abspath("results.txt")
