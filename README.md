@@ -15,8 +15,8 @@ Run as root. The bootstrap script installs dependencies and downloads `IPcheck.p
 When prompted, enter the path to a TXT file already uploaded to the VPS. Use one proxy per line:
 
 ```text
-203.0.113.10:8080
-http://user:password@203.0.113.20:3128
+
+http://user:password@203.0.11
 ```
 
 Supports HTTP and HTTPS proxies only. Maximum 500 unique entries, 5 concurrent checks, 15-second timeout.
