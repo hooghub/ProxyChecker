@@ -1,0 +1,13 @@
+# Proxy lists and scan results
+*.txt
+!requirements.txt
+!README.txt
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local secrets
+.env
